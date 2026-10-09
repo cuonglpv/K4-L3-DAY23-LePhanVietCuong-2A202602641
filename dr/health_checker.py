@@ -20,22 +20,99 @@ CÂU HỎI PHẢI TRẢ LỜI TRƯỚC KHI VIẾT (ghi câu trả lời vào rep
 """
 import argparse
 import json
+import os
 import pathlib
 import time
 
 import httpx
 
-URL = {"a": "http://127.0.0.1:8001", "b": "http://127.0.0.1:8002"}
+URL = {
+    "a": os.environ.get("REGION_A_URL", "http://127.0.0.1:8001"),
+    "b": os.environ.get("REGION_B_URL", "http://127.0.0.1:8002"),
+}
 
 
 def probe(region: str, timeout: float) -> tuple[bool, str]:
-    """TODO: trả về (ready, reason). Timeout PHẢI có — netblock làm request treo mãi."""
-    raise NotImplementedError
+    """Probe readiness của một region và luôn giới hạn thời gian chờ."""
+    if region not in URL:
+        return False, f"unknown_region={region}"
+    try:
+        response = httpx.get(f"{URL[region]}/readyz", timeout=timeout)
+        if response.status_code == 200:
+            return True, "ready"
+
+        # Giữ lại lý do readiness nếu upstream trả JSON như serving/app.py.
+        try:
+            body = response.json()
+            reasons = body.get("reasons") or []
+            detail = ",".join(str(reason) for reason in reasons)
+        except (ValueError, TypeError, AttributeError):
+            detail = ""
+        reason = f"http_status={response.status_code}"
+        return False, f"{reason}:{detail}" if detail else reason
+    except httpx.TimeoutException as exc:
+        return False, f"timeout:{type(exc).__name__}"
+    except httpx.HTTPError as exc:
+        return False, f"http_error:{type(exc).__name__}"
+    except Exception as exc:  # Một probe lỗi không được làm chết cả checker.
+        return False, f"probe_error:{type(exc).__name__}"
 
 
 def run(interval: float, timeout: float, threshold: int, duration: float, out: pathlib.Path):
-    """TODO: vòng lặp poll + phát hiện transition + ghi JSONL."""
-    raise NotImplementedError
+    """Poll cả hai region và chỉ ghi log khi trạng thái thực sự thay đổi."""
+    if interval <= 0:
+        raise ValueError("interval must be > 0")
+    if timeout <= 0:
+        raise ValueError("timeout must be > 0")
+    if threshold < 1:
+        raise ValueError("threshold must be >= 1")
+    if duration < 0:
+        raise ValueError("duration must be >= 0")
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    state = {region: "HEALTHY" for region in URL}
+    consecutive_fails = {region: 0 for region in URL}
+    deadline = time.monotonic() + duration
+    next_poll = time.monotonic()
+    emitted: list[dict] = []
+
+    while time.monotonic() < deadline:
+        for region in URL:
+            ready, reason = probe(region, timeout)
+            if ready:
+                consecutive_fails[region] = 0
+                new_state = "HEALTHY"
+            else:
+                consecutive_fails[region] += 1
+                new_state = ("UNHEALTHY" if consecutive_fails[region] >= threshold
+                             else state[region])
+
+            if new_state != state[region]:
+                now = time.time()
+                record = {
+                    "ts": now,
+                    "iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+                    "event": "state_change",
+                    "region": region,
+                    "from": state[region],
+                    "to": new_state,
+                    "reason": reason,
+                    "consecutive_fails": consecutive_fails[region],
+                    "interval_s": interval,
+                    "threshold": threshold,
+                }
+                with out.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+                print(json.dumps(record, ensure_ascii=False), flush=True)
+                emitted.append(record)
+                state[region] = new_state
+
+        next_poll += interval
+        sleep_for = min(next_poll - time.monotonic(), deadline - time.monotonic())
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+
+    return emitted
 
 
 if __name__ == "__main__":

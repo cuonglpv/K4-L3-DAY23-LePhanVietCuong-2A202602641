@@ -37,7 +37,28 @@ import httpx
 
 EVENTS = pathlib.Path("chaos/chaos-events.jsonl")
 PID_DIR = pathlib.Path("run")
-URL = {"a": "http://127.0.0.1:8001", "b": "http://127.0.0.1:8002"}
+URL = {
+    "a": os.environ.get("REGION_A_URL", "http://127.0.0.1:8001"),
+    "b": os.environ.get("REGION_B_URL", "http://127.0.0.1:8002"),
+}
+
+
+def suspend_process(pid: int):
+    """SIGSTOP equivalent on Windows, where signal.SIGSTOP is unavailable."""
+    if os.name == "nt":
+        import psutil
+        psutil.Process(pid).suspend()
+    else:
+        os.kill(pid, signal.SIGSTOP)
+
+
+def resume_process(pid: int):
+    """SIGCONT equivalent paired with suspend_process."""
+    if os.name == "nt":
+        import psutil
+        psutil.Process(pid).resume()
+    else:
+        os.kill(pid, signal.SIGCONT)
 
 
 def event(**kw):
@@ -96,7 +117,13 @@ def kill(region: str, mode: str, backend: str, force_both: bool, mock: bool):
         # netblock: SIGSTOP -> TCP handshake vẫn xong nhưng không ai trả lời => request TREO
         #           (đúng hành vi của iptables DROP ở tầng app)
         # stop    : SIGKILL -> cổng đóng => ConnectError ngay
-        os.kill(pid, signal.SIGSTOP if mode == "netblock" else signal.SIGKILL)
+        if mode == "netblock":
+            suspend_process(pid)
+        elif os.name == "nt":
+            import psutil
+            psutil.Process(pid).kill()
+        else:
+            os.kill(pid, signal.SIGKILL)
     else:
         svc = f"serving-{region}"
         if mode == "stop":
@@ -111,8 +138,9 @@ def restore(region: str, backend: str):
     if backend == "bare":
         pid = pid_of(region)
         if pid:
-            os.kill(pid, signal.SIGCONT)
-            return event(action="restore", region=region, method="SIGCONT", pid=pid)
+            resume_process(pid)
+            method = "psutil.resume" if os.name == "nt" else "SIGCONT"
+            return event(action="restore", region=region, method=method, pid=pid)
         return event(action="restore", region=region, method="need_manual_start",
                      note="process da bi SIGKILL, chay `make up-bare` lai")
     subprocess.run(["docker", "compose", "start", f"serving-{region}"], check=False)
